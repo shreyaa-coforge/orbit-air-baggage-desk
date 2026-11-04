@@ -1,0 +1,22 @@
+{
+    "permissions": {
+      "deny": [
+        "Read(./.env)",
+        "Read(./.env.*)",
+        "Bash(cat .env*)",
+        "Bash(git push:*)"
+      ]
+    },
+    "hooks": {
+      "Stop": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "cd \"$CLAUDE_PROJECT_DIR\" && if [ ! -x .venv/bin/python ]; then echo 'No .venv found, skipping pytest.' 1>&2; exit 0; fi; .venv/bin/python -m pytest -q 1>&2; code=$?; if [ $code -eq 0 ] || [ $code -eq 5 ]; then exit 0; fi; echo 'pytest is failing. Keep working until all tests pass. Do not edit any test file.' 1>&2; exit 2"
+            }
+          ]
+        }
+      ]
+    }
+  }
