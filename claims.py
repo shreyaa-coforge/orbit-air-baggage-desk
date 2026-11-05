@@ -11,6 +11,17 @@ DEADLINE_HOURS = {
 }
 
 
+# Every allowed status change, in one place. A status missing from a set
+# cannot be reached from that key's status. "closed" is final.
+ALLOWED_CHANGES = {
+    "open": {"assigned", "escalated"},
+    "assigned": {"resolved", "escalated"},
+    "escalated": {"assigned", "resolved"},
+    "resolved": {"closed"},
+    "closed": set(),
+}
+
+
 def _require_text(value, field):
     if value is None or not str(value).strip():
         raise ValueError(f"{field} cannot be blank")
@@ -64,3 +75,76 @@ def list_claims(conn, status=None, tier=None):
         query += " WHERE " + " AND ".join(conditions)
     query += " ORDER BY id"
     return conn.execute(query, params).fetchall()
+
+
+def _current_status(conn, claim_id):
+    row = conn.execute("SELECT status FROM claims WHERE id = ?", (claim_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"claim {claim_id} does not exist")
+    return row["status"]
+
+
+def _check_change(old_status, new_status):
+    if new_status not in ALLOWED_CHANGES:
+        raise ValueError(f"unknown status {new_status!r}")
+    if new_status not in ALLOWED_CHANGES[old_status]:
+        allowed = ", ".join(sorted(ALLOWED_CHANGES[old_status])) or "nothing (final)"
+        raise ValueError(
+            f"cannot change a {old_status} claim to {new_status}; allowed: {allowed}"
+        )
+
+
+def _apply_change(conn, claim_id, new_status, changed_by, now, agent=None):
+    """Validate the change, then update the claim and record history in one transaction."""
+    changed_by = _require_text(changed_by, "changed_by")
+    old_status = _current_status(conn, claim_id)
+    _check_change(old_status, new_status)
+
+    with conn:
+        if agent is None:
+            conn.execute(
+                "UPDATE claims SET status = ? WHERE id = ?", (new_status, claim_id)
+            )
+        else:
+            conn.execute(
+                "UPDATE claims SET status = ?, assigned_agent = ? WHERE id = ?",
+                (new_status, agent, claim_id),
+            )
+        conn.execute(
+            "INSERT INTO history (claim_id, old_status, new_status, changed_by, changed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (claim_id, old_status, new_status, changed_by, now.isoformat()),
+        )
+
+
+def change_status(conn, claim_id, new_status, changed_by, now):
+    """Move a claim to new_status if ALLOWED_CHANGES permits it.
+
+    Raises ValueError and saves nothing if the change is not allowed.
+    """
+    _apply_change(conn, claim_id, new_status, changed_by, now)
+
+
+def assign_claim(conn, claim_id, agent, changed_by, now):
+    """Assign a claim to an agent and move it to assigned."""
+    agent = _require_text(agent, "agent")
+    _apply_change(conn, claim_id, "assigned", changed_by, now, agent=agent)
+
+
+def resolve_claim(conn, claim_id, changed_by, now):
+    """Move a claim to resolved."""
+    _apply_change(conn, claim_id, "resolved", changed_by, now)
+
+
+def close_claim(conn, claim_id, changed_by, now):
+    """Move a claim to closed."""
+    _apply_change(conn, claim_id, "closed", changed_by, now)
+
+
+def get_history(conn, claim_id):
+    """Return every history entry for a claim, oldest first."""
+    return conn.execute(
+        "SELECT id, claim_id, old_status, new_status, changed_by, changed_at "
+        "FROM history WHERE claim_id = ? ORDER BY id",
+        (claim_id,),
+    ).fetchall()
