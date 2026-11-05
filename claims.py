@@ -1,6 +1,6 @@
 """Claim filing and listing rules. No function here reads the real clock."""
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from db import CLAIM_TYPES, TIERS
 
@@ -77,11 +77,13 @@ def list_claims(conn, status=None, tier=None):
     return conn.execute(query, params).fetchall()
 
 
-def _current_status(conn, claim_id):
-    row = conn.execute("SELECT status FROM claims WHERE id = ?", (claim_id,)).fetchone()
+def _load_claim(conn, claim_id):
+    row = conn.execute(
+        "SELECT status, deadline FROM claims WHERE id = ?", (claim_id,)
+    ).fetchone()
     if row is None:
         raise ValueError(f"claim {claim_id} does not exist")
-    return row["status"]
+    return row
 
 
 def _check_change(old_status, new_status):
@@ -97,9 +99,17 @@ def _check_change(old_status, new_status):
 def _apply_change(conn, claim_id, new_status, changed_by, now, agent=None):
     """Validate the change, then update the claim and record history in one transaction."""
     changed_by = _require_text(changed_by, "changed_by")
-    old_status = _current_status(conn, claim_id)
+    claim = _load_claim(conn, claim_id)
+    old_status = claim["status"]
     _check_change(old_status, new_status)
+    if new_status == "escalated" and not is_overdue(claim["deadline"], now):
+        raise ValueError(
+            f"claim {claim_id} is not overdue (deadline {claim['deadline']}); "
+            "only overdue claims can be escalated"
+        )
 
+    # Claim update first, then history, in one transaction: if the history
+    # insert fails, the claim update is rolled back too.
     with conn:
         if agent is None:
             conn.execute(
@@ -148,3 +158,49 @@ def get_history(conn, claim_id):
         "FROM history WHERE claim_id = ? ORDER BY id",
         (claim_id,),
     ).fetchall()
+
+
+ESCALATABLE_STATUSES = ("open", "assigned")
+
+
+def is_overdue(deadline, now):
+    """Return True only when now is strictly later than the deadline.
+
+    deadline may be a datetime or an ISO timestamp string as stored in the database.
+    """
+    if isinstance(deadline, str):
+        deadline = datetime.fromisoformat(deadline)
+    return now > deadline
+
+
+def escalate_claim(conn, claim_id, changed_by, now):
+    """Escalate one open or assigned claim that is overdue.
+
+    Raises ValueError and saves nothing otherwise.
+    """
+    status = _load_claim(conn, claim_id)["status"]
+    if status not in ESCALATABLE_STATUSES:
+        raise ValueError(
+            f"cannot escalate a {status} claim; only open or assigned claims can be escalated"
+        )
+    change_status(conn, claim_id, "escalated", changed_by, now)
+
+
+def escalate_overdue(conn, changed_by, now):
+    """Escalate every overdue open or assigned claim. Return the escalated ids.
+
+    Each claim is escalated in its own transaction. A database error is not
+    caught: it rolls back that claim's escalation and is raised to the caller.
+    """
+    placeholders = ", ".join("?" for _ in ESCALATABLE_STATUSES)
+    candidates = conn.execute(
+        f"SELECT id, deadline FROM claims WHERE status IN ({placeholders}) ORDER BY id",
+        ESCALATABLE_STATUSES,
+    ).fetchall()
+
+    escalated = []
+    for row in candidates:
+        if is_overdue(row["deadline"], now):
+            escalate_claim(conn, row["id"], changed_by, now)
+            escalated.append(row["id"])
+    return escalated
