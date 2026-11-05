@@ -5,6 +5,7 @@ and the current local time otherwise. All rules live in claims.py.
 """
 
 import argparse
+import csv
 import sqlite3
 import sys
 from datetime import datetime
@@ -27,8 +28,8 @@ def build_parser():
     file_cmd.add_argument("--note")
 
     list_cmd = commands.add_parser("list", help="list claims")
-    list_cmd.add_argument("--status")
-    list_cmd.add_argument("--tier")
+    list_cmd.add_argument("--status", choices=db.STATUSES)
+    list_cmd.add_argument("--tier", choices=db.TIERS)
 
     assign_cmd = commands.add_parser("assign", help="assign a claim to an agent")
     assign_cmd.add_argument("claim_id", type=int)
@@ -56,9 +57,15 @@ def pick_now(value):
     if value is None:
         return datetime.now().replace(microsecond=0)
     try:
-        return datetime.fromisoformat(value)
+        now = datetime.fromisoformat(value)
     except ValueError:
         raise ValueError(f"--now must be an ISO timestamp, got {value!r}") from None
+    if now.tzinfo is not None:
+        raise ValueError(
+            f"--now must be a local time without a timezone "
+            f"(like 2026-11-02T09:00:00), got {value!r}"
+        )
+    return now
 
 
 def print_claims(rows):
@@ -108,7 +115,8 @@ def run_command(args, conn, now):
     elif args.command == "history":
         print_history(claims.get_history(conn, args.claim_id))
     elif args.command == "seed":
-        with open(args.csv_path, newline="", encoding="utf-8") as csv_file:
+        # utf-8-sig also accepts files saved with a byte-order mark (e.g. by Excel).
+        with open(args.csv_path, newline="", encoding="utf-8-sig") as csv_file:
             ids = claims.seed_claims(conn, csv_file, now)
         print(f"Loaded {len(ids)} claims.")
 
@@ -123,7 +131,7 @@ def main(argv=None):
             run_command(args, conn, now)
         finally:
             conn.close()
-    except (ValueError, sqlite3.Error, OSError) as exc:
+    except (ValueError, sqlite3.Error, csv.Error, OSError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     return 0

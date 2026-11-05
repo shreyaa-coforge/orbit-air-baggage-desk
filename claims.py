@@ -47,23 +47,31 @@ def file_claim(conn, passenger, flight, claim_type, tier, note, now):
 
     Returns the new claim id. Raises ValueError on invalid input.
     """
+    with conn:
+        return _insert_claim(conn, passenger, flight, claim_type, tier, note, now)
+
+
+def _insert_claim(conn, passenger, flight, claim_type, tier, note, now):
+    """Validate and insert one claim plus its filing history entry.
+
+    Does not open or commit a transaction; the caller wraps it in "with conn:".
+    """
     passenger, flight = _validate_claim(passenger, flight, claim_type, tier)
 
     filed_at = now.isoformat()
     deadline = (now + timedelta(hours=DEADLINE_HOURS[tier])).isoformat()
 
-    with conn:
-        cursor = conn.execute(
-            "INSERT INTO claims (passenger, flight, type, tier, status, note, filed_at, deadline) "
-            "VALUES (?, ?, ?, ?, 'open', ?, ?, ?)",
-            (passenger, flight, claim_type, tier, note, filed_at, deadline),
-        )
-        claim_id = cursor.lastrowid
-        conn.execute(
-            "INSERT INTO history (claim_id, old_status, new_status, changed_by, changed_at) "
-            "VALUES (?, NULL, 'open', 'system', ?)",
-            (claim_id, filed_at),
-        )
+    cursor = conn.execute(
+        "INSERT INTO claims (passenger, flight, type, tier, status, note, filed_at, deadline) "
+        "VALUES (?, ?, ?, ?, 'open', ?, ?, ?)",
+        (passenger, flight, claim_type, tier, note, filed_at, deadline),
+    )
+    claim_id = cursor.lastrowid
+    conn.execute(
+        "INSERT INTO history (claim_id, old_status, new_status, changed_by, changed_at) "
+        "VALUES (?, NULL, 'open', 'system', ?)",
+        (claim_id, filed_at),
+    )
     return claim_id
 
 
@@ -159,7 +167,11 @@ def close_claim(conn, claim_id, changed_by, now):
 
 
 def get_history(conn, claim_id):
-    """Return every history entry for a claim, oldest first."""
+    """Return every history entry for a claim, oldest first.
+
+    Raises ValueError if the claim does not exist.
+    """
+    _load_claim(conn, claim_id)
     return conn.execute(
         "SELECT id, claim_id, old_status, new_status, changed_by, changed_at "
         "FROM history WHERE claim_id = ? ORDER BY id",
@@ -220,7 +232,8 @@ def seed_claims(conn, csv_file, now):
     """File one claim per CSV row (columns passenger, flight, type, tier, note).
 
     csv_file is an open text file. Every row is checked with the file_claim
-    rules before anything is saved, so one bad row means no rows are loaded.
+    rules before anything is saved, and all inserts run in one transaction,
+    so a bad row or a failed insert means no rows are loaded.
     CSV contents, including notes, are stored as plain data.
     Returns the new claim ids in file order.
     """
@@ -238,7 +251,8 @@ def seed_claims(conn, csv_file, now):
         note = (row["note"] or "").strip() or None
         rows.append((row["passenger"], row["flight"], row["type"], row["tier"], note))
 
-    return [
-        file_claim(conn, passenger, flight, claim_type, tier, note, now)
-        for passenger, flight, claim_type, tier, note in rows
-    ]
+    with conn:
+        return [
+            _insert_claim(conn, passenger, flight, claim_type, tier, note, now)
+            for passenger, flight, claim_type, tier, note in rows
+        ]
